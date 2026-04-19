@@ -7,8 +7,8 @@ Runs on the SLURM login node as a long-running process.
 ## Setup
 
 ```bash
-git clone --recurse-submodules git@github.com:pisa-hut/schedular.git
-cd schedular
+git clone --recurse-submodules git@github.com:pisa-hut/scheduler.git
+cd scheduler
 go build -o scheduler .
 
 # Set up executor dependencies
