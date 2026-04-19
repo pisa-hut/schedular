@@ -27,9 +27,10 @@ type Task struct {
 	RetryCount  int    `json:"retry_count"`
 }
 
+const executorDir = "./executor"
+
 type Config struct {
 	ManagerURL     string
-	ExecutorDir    string
 	PollInterval   time.Duration
 	SlurmPartition string
 	SlurmTime      string
@@ -51,7 +52,6 @@ func loadConfig() Config {
 
 	return Config{
 		ManagerURL:     mustEnv("MANAGER_URL"),
-		ExecutorDir:    getenv("EXECUTOR_DIR", "./executor"),
 		PollInterval:   time.Duration(pollSec) * time.Second,
 		SlurmPartition: getenv("SLURM_PARTITION", ""),
 		SlurmTime:      getenv("SLURM_TIME", "01:00:00"),
@@ -187,13 +187,13 @@ uv run python -m executor.main %s
 echo
 echo "End Time:      $(date)"
 `, taskID,
-		cfg.ExecutorDir, taskID,
-		cfg.ExecutorDir, taskID,
+		executorDir, taskID,
+		executorDir, taskID,
 		cfg.SlurmTime,
 		cfg.SlurmCPUs,
 		cfg.SlurmMem,
 		partitionLine,
-		cfg.ExecutorDir,
+		executorDir,
 		taskID,
 		argsStr,
 	)
@@ -232,7 +232,6 @@ func main() {
 
 	log.Printf("[INFO] PISA Scheduler starting")
 	log.Printf("[INFO] Manager URL: %s", cfg.ManagerURL)
-	log.Printf("[INFO] Executor dir: %s", cfg.ExecutorDir)
 	log.Printf("[INFO] Backend: %s", cfg.Backend)
 	log.Printf("[INFO] Poll interval: %s", cfg.PollInterval)
 	if cfg.MaxJobs > 0 {
@@ -240,8 +239,8 @@ func main() {
 	}
 
 	// Ensure output dirs
-	os.MkdirAll(filepath.Join(cfg.ExecutorDir, "outputs", "stdout"), 0o755)
-	os.MkdirAll(filepath.Join(cfg.ExecutorDir, "outputs", "stderr"), 0o755)
+	os.MkdirAll(filepath.Join(executorDir, "outputs", "stdout"), 0o755)
+	os.MkdirAll(filepath.Join(executorDir, "outputs", "stderr"), 0o755)
 
 	submitted := make(map[int]struct{})
 	var mu sync.Mutex
