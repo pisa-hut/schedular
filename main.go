@@ -1,5 +1,19 @@
 package main
 
+// PISA Scheduler — a capacity controller, intentionally task-blind.
+//
+// Responsibility: make sure every task that still needs work has (or
+// will soon have) an executor to run it.
+//
+//     queued_slurm_jobs + running_slurm_jobs  ==  pending_tasks + running_tasks
+//
+// The scheduler never names a task on the sbatch command line; each
+// executor, once SLURM places it on a node, calls /task/claim with no
+// filter and takes whatever is next. That keeps scheduling and task
+// dispatch orthogonal: the manager decides *which* task runs where,
+// and in what order (retry, priority, etc.); the scheduler just feeds
+// the cluster enough bodies to service the backlog.
+
 import (
 	"encoding/json"
 	"fmt"
@@ -11,20 +25,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
 
 type Task struct {
-	ID          int    `json:"id"`
-	PlanID      int    `json:"plan_id"`
-	AvID        int    `json:"av_id"`
-	SimulatorID int    `json:"simulator_id"`
-	SamplerID   int    `json:"sampler_id"`
-	TaskStatus  string `json:"task_status"`
-	CreatedAt   string `json:"created_at"`
-	RetryCount  int    `json:"retry_count"`
+	ID         int    `json:"id"`
+	TaskStatus string `json:"task_status"`
 }
 
 const executorDir = "./executor"
@@ -38,6 +45,7 @@ type Config struct {
 	SlurmMem       string
 	Backend        string
 	MaxJobs        int
+	JobName        string
 }
 
 func loadConfig() Config {
@@ -55,6 +63,7 @@ func loadConfig() Config {
 		SlurmMem:       getenv("SLURM_MEM", "12G"),
 		Backend:        getenv("EXECUTOR_BACKEND", "apptainer"),
 		MaxJobs:        maxJobs,
+		JobName:        getenv("SLURM_JOB_NAME", "pisa-exec"),
 	}
 }
 
@@ -95,35 +104,52 @@ func loadDotenv() {
 	}
 }
 
-func fetchPendingTasks(cfg Config) ([]Task, error) {
+// fetchDemand returns the number of tasks that still need an executor
+// (pending + running). `running` counts because its executor may die
+// without notice; we leave capacity carrying it until the manager's
+// reaper marks the task back to `pending`.
+func fetchDemand(cfg Config) (int, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(cfg.ManagerURL + "/task")
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return 0, fmt.Errorf("fetch tasks: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		return 0, fmt.Errorf("task endpoint returned %d", resp.StatusCode)
 	}
 
 	var tasks []Task
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
-		return nil, fmt.Errorf("decode failed: %w", err)
+		return 0, fmt.Errorf("decode tasks: %w", err)
 	}
 
-	var pending []Task
+	count := 0
 	for _, t := range tasks {
-		if t.TaskStatus == "pending" {
-			pending = append(pending, t)
+		if t.TaskStatus == "pending" || t.TaskStatus == "running" {
+			count++
 		}
 	}
-	return pending, nil
+	return count, nil
 }
 
-func countSlurmJobs() int {
-	out, err := exec.Command("squeue", "--me", "--noheader", "--format=%i").Output()
+// countOurSlurmJobs returns pending+running SLURM jobs owned by the
+// current user that match our job name. Anything else in the user's
+// queue (other projects, manual submissions) is ignored.
+func countOurSlurmJobs(jobName string) int {
+	out, err := exec.Command(
+		"squeue",
+		"--me",
+		"--noheader",
+		"--name="+jobName,
+		"--format=%i",
+	).Output()
 	if err != nil {
+		// squeue missing (e.g. outside SLURM) or transient failure — no
+		// visible jobs. We purposely don't return an error so the
+		// scheduler keeps trying each tick.
+		log.Printf("[WARN] squeue call failed: %v", err)
 		return 0
 	}
 	lines := strings.TrimSpace(string(out))
@@ -133,8 +159,8 @@ func countSlurmJobs() int {
 	return len(strings.Split(lines, "\n"))
 }
 
-func buildSbatchScript(cfg Config, taskID int) string {
-	argsStr := fmt.Sprintf("--backend %s --task-id %d", cfg.Backend, taskID)
+func buildSbatchScript(cfg Config) string {
+	argsStr := "--backend " + cfg.Backend
 
 	partitionLine := ""
 	if cfg.SlurmPartition != "" {
@@ -142,66 +168,68 @@ func buildSbatchScript(cfg Config, taskID int) string {
 	}
 
 	return fmt.Sprintf(`#!/bin/bash
-#SBATCH --job-name=pisa-%d
-#SBATCH --output=%s/outputs/stdout/task_%d_%%j
-#SBATCH --error=%s/outputs/stderr/task_%d_%%j
+#SBATCH --job-name=%s
+#SBATCH --output=%s/outputs/stdout/job_%%j
+#SBATCH --error=%s/outputs/stderr/job_%%j
 #SBATCH --time=%s
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=%s
 #SBATCH --mem=%s
+#SBATCH --signal=TERM@60
 %s
 
 cd %s
 
 echo "=== PISA Executor ==="
-echo "Task ID:       %d"
-echo "Job ID:        $SLURM_JOB_ID"
-echo "Node:          $SLURM_NODELIST"
-echo "Start Time:    $(date)"
+echo "Job ID:     $SLURM_JOB_ID"
+echo "Node:       $SLURM_NODELIST"
+echo "Start Time: $(date)"
 echo
 
 uv run python -m executor.main %s
 
+status=$?
 echo
-echo "End Time:      $(date)"
-`, taskID,
-		executorDir, taskID,
-		executorDir, taskID,
+echo "End Time:   $(date)"
+echo "Exit:       $status"
+exit $status
+`, cfg.JobName,
+		executorDir,
+		executorDir,
 		cfg.SlurmTime,
 		cfg.SlurmCPUs,
 		cfg.SlurmMem,
 		partitionLine,
 		executorDir,
-		taskID,
 		argsStr,
 	)
 }
 
-func submitSlurmJob(cfg Config, taskID int) bool {
-	script := buildSbatchScript(cfg, taskID)
+func submitSlurmJob(cfg Config) bool {
+	script := buildSbatchScript(cfg)
 
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("pisa_task_%d_*.sh", taskID))
+	tmpFile, err := os.CreateTemp("", "pisa_exec_*.sh")
 	if err != nil {
-		log.Printf("[ERROR] Failed to create temp file for task #%d: %v", taskID, err)
+		log.Printf("[ERROR] temp file: %v", err)
 		return false
 	}
 	defer os.Remove(tmpFile.Name())
 
 	if _, err := tmpFile.WriteString(script); err != nil {
-		log.Printf("[ERROR] Failed to write script for task #%d: %v", taskID, err)
+		log.Printf("[ERROR] write script: %v", err)
 		return false
 	}
 	tmpFile.Close()
 
 	out, err := exec.Command("sbatch", tmpFile.Name()).CombinedOutput()
 	if err != nil {
-		log.Printf("[ERROR] sbatch failed for task #%d: %s", taskID, strings.TrimSpace(string(out)))
+		log.Printf("[ERROR] sbatch: %s", strings.TrimSpace(string(out)))
 		return false
 	}
 
 	parts := strings.Fields(strings.TrimSpace(string(out)))
 	jobID := parts[len(parts)-1]
-	log.Printf("[INFO] Submitted SLURM job %s for task #%d", jobID, taskID)
+	log.Printf("[INFO] submitted SLURM job %s", jobID)
 	return true
 }
 
@@ -209,21 +237,15 @@ func main() {
 	cfg := loadConfig()
 
 	log.Printf("[INFO] PISA Scheduler starting")
-	log.Printf("[INFO] Manager URL: %s", cfg.ManagerURL)
-	log.Printf("[INFO] Backend: %s", cfg.Backend)
-	log.Printf("[INFO] Poll interval: %s", cfg.PollInterval)
+	log.Printf("[INFO] manager_url=%s backend=%s job_name=%s", cfg.ManagerURL, cfg.Backend, cfg.JobName)
+	log.Printf("[INFO] poll_interval=%s", cfg.PollInterval)
 	if cfg.MaxJobs > 0 {
-		log.Printf("[INFO] Max concurrent jobs: %d", cfg.MaxJobs)
+		log.Printf("[INFO] max_concurrent_jobs=%d", cfg.MaxJobs)
 	}
 
-	// Ensure output dirs
 	os.MkdirAll(filepath.Join(executorDir, "outputs", "stdout"), 0o755)
 	os.MkdirAll(filepath.Join(executorDir, "outputs", "stderr"), 0o755)
 
-	submitted := make(map[int]struct{})
-	var mu sync.Mutex
-
-	// Graceful shutdown
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
@@ -231,61 +253,43 @@ func main() {
 	defer ticker.Stop()
 
 	poll := func() {
-		pending, err := fetchPendingTasks(cfg)
+		demand, err := fetchDemand(cfg)
 		if err != nil {
 			log.Printf("[ERROR] %v", err)
 			return
 		}
+		supply := countOurSlurmJobs(cfg.JobName)
 
-		mu.Lock()
-		defer mu.Unlock()
-
-		// Clean up submitted tasks that are no longer pending
-		pendingIDs := make(map[int]struct{})
-		for _, t := range pending {
-			pendingIDs[t.ID] = struct{}{}
-		}
-		for id := range submitted {
-			if _, ok := pendingIDs[id]; !ok {
-				delete(submitted, id)
+		toSubmit := demand - supply
+		if toSubmit <= 0 {
+			if demand > 0 || supply > 0 {
+				log.Printf("[INFO] demand=%d supply=%d (balanced)", demand, supply)
 			}
-		}
-
-		// Find new tasks
-		var newTasks []Task
-		for _, t := range pending {
-			if _, ok := submitted[t.ID]; !ok {
-				newTasks = append(newTasks, t)
-			}
-		}
-
-		if len(newTasks) == 0 {
 			return
 		}
 
-		log.Printf("[INFO] Found %d new pending tasks", len(newTasks))
-
-		// Check job limit
 		if cfg.MaxJobs > 0 {
-			running := countSlurmJobs()
-			slots := cfg.MaxJobs - running
-			if slots <= 0 {
-				log.Printf("[INFO] At max concurrent jobs (%d), skipping", cfg.MaxJobs)
-				return
+			slots := cfg.MaxJobs - supply
+			if slots < 0 {
+				slots = 0
 			}
-			if len(newTasks) > slots {
-				newTasks = newTasks[:slots]
+			if toSubmit > slots {
+				toSubmit = slots
 			}
 		}
 
-		for _, t := range newTasks {
-			if submitSlurmJob(cfg, t.ID) {
-				submitted[t.ID] = struct{}{}
-			}
+		if toSubmit == 0 {
+			log.Printf("[INFO] demand=%d supply=%d at max_concurrent_jobs=%d, waiting",
+				demand, supply, cfg.MaxJobs)
+			return
+		}
+
+		log.Printf("[INFO] demand=%d supply=%d → submitting %d", demand, supply, toSubmit)
+		for i := 0; i < toSubmit; i++ {
+			submitSlurmJob(cfg)
 		}
 	}
 
-	// Initial poll
 	poll()
 
 	for {
@@ -293,7 +297,7 @@ func main() {
 		case <-ticker.C:
 			poll()
 		case <-sig:
-			log.Printf("[INFO] Scheduler stopped")
+			log.Printf("[INFO] scheduler stopped")
 			return
 		}
 	}
