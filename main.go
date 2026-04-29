@@ -5,7 +5,7 @@ package main
 // Responsibility: make sure every task that still needs work has (or
 // will soon have) an executor to run it.
 //
-//     queued_slurm_jobs + running_slurm_jobs  ==  pending_tasks + running_tasks
+//     queued_slurm_jobs + running_slurm_jobs  ==  queued_tasks + running_tasks
 //
 // The scheduler never names a task on the sbatch command line; each
 // executor, once SLURM places it on a node, calls /task/claim with no
@@ -137,7 +137,9 @@ func fetchDemand(cfg Config) (int, error) {
 // countOurSlurmJobs returns pending+running SLURM jobs owned by the
 // current user that match our job name. Anything else in the user's
 // queue (other projects, manual submissions) is ignored.
-func countOurSlurmJobs(jobName string) int {
+// Returns an error on squeue failure so the caller can skip the tick
+// rather than assuming zero supply and over-submitting.
+func countOurSlurmJobs(jobName string) (int, error) {
 	out, err := exec.Command(
 		"squeue",
 		"--me",
@@ -146,17 +148,13 @@ func countOurSlurmJobs(jobName string) int {
 		"--format=%i",
 	).Output()
 	if err != nil {
-		// squeue missing (e.g. outside SLURM) or transient failure — no
-		// visible jobs. We purposely don't return an error so the
-		// scheduler keeps trying each tick.
-		log.Printf("[WARN] squeue call failed: %v", err)
-		return 0
+		return 0, fmt.Errorf("squeue call failed: %w", err)
 	}
 	lines := strings.TrimSpace(string(out))
 	if lines == "" {
-		return 0
+		return 0, nil
 	}
-	return len(strings.Split(lines, "\n"))
+	return len(strings.Split(lines, "\n")), nil
 }
 
 func buildSbatchScript(cfg Config) string {
@@ -213,13 +211,13 @@ func submitSlurmJob(cfg Config) bool {
 		log.Printf("[ERROR] temp file: %v", err)
 		return false
 	}
+	defer tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
 
 	if _, err := tmpFile.WriteString(script); err != nil {
 		log.Printf("[ERROR] write script: %v", err)
 		return false
 	}
-	tmpFile.Close()
 
 	out, err := exec.Command("sbatch", tmpFile.Name()).CombinedOutput()
 	if err != nil {
@@ -228,6 +226,10 @@ func submitSlurmJob(cfg Config) bool {
 	}
 
 	parts := strings.Fields(strings.TrimSpace(string(out)))
+	if len(parts) == 0 {
+		log.Printf("[WARN] sbatch returned unexpected empty output")
+		return true
+	}
 	jobID := parts[len(parts)-1]
 	log.Printf("[INFO] submitted SLURM job %s", jobID)
 	return true
@@ -258,7 +260,11 @@ func main() {
 			log.Printf("[ERROR] %v", err)
 			return
 		}
-		supply := countOurSlurmJobs(cfg.JobName)
+		supply, err := countOurSlurmJobs(cfg.JobName)
+		if err != nil {
+			log.Printf("[WARN] skipping tick: %v", err)
+			return
+		}
 
 		toSubmit := demand - supply
 		if toSubmit <= 0 {
